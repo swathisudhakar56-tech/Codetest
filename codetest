@@ -1,0 +1,145 @@
+# vulnerable_app.py
+# Run only in an isolated test environment.
+# python3 -m venv venv && . venv/bin/activate
+# pip install flask requests
+# FLASK_APP=vulnerable_app.py flask run --port=5001
+
+from flask import Flask, request, session, redirect, url_for, render_template_string, g
+import sqlite3
+import hashlib
+import requests
+
+app = Flask(__name__)
+app.secret_key = "dev-secret-key"   # BROKEN ACCESS CONTROL: predictable secret
+
+DATABASE = "test.db"
+
+# -------------------------
+# DB helpers (insecure)
+# -------------------------
+def get_db():
+    db = getattr(g, "_db", None)
+    if db is None:
+        db = g._db = sqlite3.connect(DATABASE)
+    return db
+
+@app.before_first_request
+def init_db():
+    db = sqlite3.connect(DATABASE)
+    cur = db.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT, role TEXT)")
+    # Insert an example user (password stored with weak hash)
+    try:
+        cur.execute("INSERT INTO users(username, password, role) VALUES (?, ?, ?)",
+                    ("admin", hashlib.md5(b"admin123").hexdigest(), "admin"))
+        cur.execute("INSERT INTO users(username, password, role) VALUES (?, ?, ?)",
+                    ("user", hashlib.md5(b"user123").hexdigest(), "user"))
+    except sqlite3.IntegrityError:
+        pass
+    db.commit()
+    db.close()
+
+# -------------------------
+# Vulnerable login endpoint
+# - CRYPTOGRAPHIC FAILURE: MD5 for password hashing (weak, no salt)
+# - INJECTION: naive SQL built later in profile view
+# -------------------------
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form.get("username","")
+        password = request.form.get("password","")
+        # weak hashing, no salt
+        hashed = hashlib.md5(password.encode()).hexdigest()
+        cur = get_db().cursor()
+        # using parameterized query here (intentionally secure), but other endpoints are NOT
+        cur.execute("SELECT id, role FROM users WHERE username=? AND password=?", (username, hashed))
+        row = cur.fetchone()
+        if row:
+            session["user_id"] = row[0]
+            session["role"] = row[1]
+            return redirect(url_for("profile"))
+        return "Invalid credentials", 401
+    return """
+      <form method="post">
+        <input name="username" placeholder="username"/><br/>
+        <input name="password" placeholder="password" type="password"/><br/>
+        <button>Login</button>
+      </form>
+    """
+
+# -------------------------
+# BROKEN ACCESS CONTROL + SQL INJECTION example
+# - /profile lets any logged-in user view arbitrary user info via 'id' param
+# - it constructs SQL query using string formatting -> SQL Injection
+# - it does NOT check role/ownership properly
+# -------------------------
+@app.route("/profile")
+def profile():
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+    # attacker-controlled parameter -> SQL injection
+    target_id = request.args.get("id", str(session["user_id"]))
+    db = get_db()
+    # DANGEROUS: building SQL by concatenation
+    query = "SELECT id, username, role FROM users WHERE id = %s" % target_id
+    try:
+        cur = db.cursor()
+        cur.execute(query)   # SQL injection vulnerability
+        row = cur.fetchone()
+        if not row:
+            return "No such user", 404
+        # Broken access control: no check that the logged-in user is allowed to view this profile
+        return f"User: id={row[0]}, username={row[1]}, role={row[2]}"
+    except Exception as e:
+        return f"DB error: {e}", 500
+
+# -------------------------
+# SSRF endpoint (insecure fetch)
+# - /fetch?url=...
+# - server will fetch any URL provided by user and return its first 500 bytes
+# -------------------------
+@app.route("/fetch")
+def fetch():
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+    target = request.args.get("url", "")
+    if not target:
+        return "Provide url parameter, e.g. /fetch?url=http://example.com", 400
+    # NO validation => SSRF risk (can hit internal services, metadata IPs, etc.)
+    try:
+        r = requests.get(target, timeout=5)   # SSRF: unvalidated server-side request
+        return r.content[:500]
+    except Exception as e:
+        return f"Fetch error: {e}", 500
+
+# -------------------------
+# Admin-only page but BROKEN ACCESS CONTROL enforcement
+# - Only checks session role client-side in a weak way
+# -------------------------
+@app.route("/admin")
+def admin():
+    # Broken: relies on session["role"] only and does not re-verify identity/privileges
+    # Also secret_key is weak/predictable making session forging easier in theory.
+    if session.get("role") != "admin":
+        return "Forbidden: admin only", 403
+    return "Welcome to admin panel (vulnerable example)."
+
+# -------------------------
+# Simple index
+# -------------------------
+@app.route("/")
+def index():
+    return render_template_string("""
+      <h2>Vulnerable demo</h2>
+      <ul>
+        <li><a href="{{ url_for('login') }}">Login</a></li>
+        <li><a href="{{ url_for('profile') }}">My profile</a> (try ?id=1 or injection)</li>
+        <li><a href="{{ url_for('fetch') }}">Fetch URL (SSRF)</a></li>
+        <li><a href="{{ url_for('admin') }}">Admin panel</a></li>
+      </ul>
+      <p>Test accounts: admin/admin123  and user/user123</p>
+    """)
+
+if __name__ == "__main__":
+    app.run(port=5001, debug=True)
